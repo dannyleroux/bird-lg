@@ -26,18 +26,20 @@ import subprocess
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import re
-from urllib2 import urlopen
-from urllib import quote, unquote
+from urllib.request import urlopen
+from urllib.parse import quote, unquote
 import json
 import random
 import argparse
+from functools import cmp_to_key
 
 from toolbox import mask_is_valid, ipv6_is_valid, ipv4_is_valid, resolve, save_cache_pickle, load_cache_pickle, unescape
 #from xml.sax.saxutils import escape
 
 
 import pydot
-from flask import Flask, render_template, jsonify, redirect, session, request, abort, Response, Markup
+from flask import Flask, render_template, jsonify, redirect, session, request, abort, Response
+from markupsafe import Markup
 parser = argparse.ArgumentParser()
 parser.add_argument('-c', dest='config_file', help='path to config file', default='lg.cfg')
 args = parser.parse_args()
@@ -50,6 +52,24 @@ app.debug = app.config["DEBUG"]
 file_handler = TimedRotatingFileHandler(filename=app.config["LOG_FILE"], when="midnight", backupCount=app.config.get("LOG_NUM_DAYS", 0))
 file_handler.setLevel(getattr(logging, app.config["LOG_LEVEL"].upper()))
 app.logger.addHandler(file_handler)
+print(f"Log file: {app.config['LOG_FILE']}")
+print(f"Log level: {app.config['LOG_LEVEL']}")
+app.config['DEBUG'] = True
+logging.basicConfig(filename='app.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+####################
+def list_routes():
+    for rule in app.url_map.iter_rules():
+        print(f"URL: {rule.endpoint}, Methods: {', '.join(rule.methods)}")
+####################
+
+def is_base64(s):
+    """Check if the string is base64 encoded"""
+    try:
+        base64.b64decode(s, validate=True)
+        return True
+    except Exception:
+        return False
 
 
 def get_asn_from_as(n):
@@ -60,19 +80,28 @@ def get_asn_from_as(n):
         return " "*5
     return [ field.strip() for field in data.split("|") ]
 
-
 def add_links(text):
-    """Browser a string and replace ipv4, ipv6, as number, with a
-    whois link """
+    """Browse a string and replace ipv4, ipv6, AS numbers with a whois link."""
 
-    if type(text) in [str, unicode]:
+    # Ensure we work with a string if not already
+    if isinstance(text, (str, bytes)):  # Check if it's a string or bytes
         text = text.split("\n")
+    else:
+        # If it's a list, convert all elements to strings
+        if isinstance(text, list):
+            text = [str(item) for item in text]
+        else:
+            text = str(text).split("\n")  # If it's not a string or list, convert to string
 
     ret_text = []
     for line in text:
-        # Some heuristic to create link
+        # Skip over non-string elements
+        if not isinstance(line, str):
+            continue
+
+        # Process the line for links
         if line.strip().startswith("BGP.as_path:") or \
-            line.strip().startswith("Neighbor AS:"):
+           line.strip().startswith("Neighbor AS:"):
             ret_text.append(re.sub(r'(\d+)', r'<a href="/whois?q=\1" class="whois">\1</a>', line))
         else:
             line = re.sub(r'([a-zA-Z0-9\-]*\.([a-zA-Z]{2,3}){1,2})(\s|$)', r'<a href="/whois?q=\1" class="whois">\1</a>\3', line)
@@ -85,6 +114,8 @@ def add_links(text):
             line = re.sub(r'\[(\w+)\s+((|\d\d\d\d-\d\d-\d\d\s)(|\d\d:)\d\d:\d\d|\w\w\w\d\d)', r'[<a href="/detail/%s?q=\1">\1</a> \2' % hosts, line)
             line = re.sub(r'(^|\s+)(([a-f\d]{0,4}:){3,10}[a-f\d]{0,4})', r'\1<a href="/whois?q=\2" class="whois">\2</a>', line, re.I)
             ret_text.append(line)
+
+    # Join the list back into a single string before returning
     return "\n".join(ret_text)
 
 
@@ -209,9 +240,13 @@ def incorrect_request(e):
 def page_not_found(e):
         return render_template('error.html', warnings=["The requested URL was not found on the server."]), 404
 
+#################################
+
 def get_query():
     q = unquote(request.args.get('q', '').strip())
     return q
+
+#################################
 
 @app.route("/whois")
 def whois():
@@ -244,7 +279,11 @@ def summary(hosts, proto="ipv4"):
     errors = []
     for host in hosts.split("+"):
         ret, res = bird_command(host, proto, command)
+        if isinstance(res, bytes):
+            res = res.decode('utf-8')
+
         res = res.split("\n")
+
 
         if ret is False:
             errors.append("%s" % res)
@@ -290,7 +329,11 @@ def detail(hosts, proto):
     errors = []
     for host in hosts.split("+"):
         ret, res = bird_command(host, proto, command)
+        if isinstance(res, bytes):
+            res = res.decode('utf-8')
+
         res = res.split("\n")
+
 
         if ret is False:
             errors.append("%s" % res)
@@ -332,6 +375,10 @@ def traceroute(hosts, proto):
         if status is False:
             errors.append("%s" % resultat)
             continue
+
+        # Decode resultat if it's in bytes
+        if isinstance(resultat, bytes):
+            resultat = resultat.decode('utf-8', errors='ignore')  # Decode bytes to string
 
 
         infos[host] = add_links(resultat)
@@ -402,14 +449,68 @@ def get_as_number_from_protocol_name(host, proto, protocol):
 
 @app.route("/bgpmap/")
 def show_bgpmap():
-    """return a bgp map in a png file, from the json tree in q argument"""
+    """Return a BGP map in a PNG file, from the JSON tree in q argument"""
 
-    data = get_query()
+
+    app.logger.debug("Before calling get_query()")
+    data = get_query() 
+    print(f"Data received from get_query: {data}")
+    app.logger.debug(f"Data received from get_query: {data}")
+    app.logger.debug(f"Initial data type: {type(data)}")
+
     if not data:
-        abort(400)
+        print("No data received from the query.")
+        app.logger.warning("No data received from get_query()")
+        return abort(400)  # Handle no data case
 
-    data = base64.b64decode(data)
-    data = json.loads(data)
+    # If data is a string, attempt to decode it from base64 and JSON parse
+    if isinstance(data, str):
+        try:
+            # Check if data starts with 'b' (indicating it's a byte literal) and strip it
+            if data.startswith("b'") and data.endswith("'"):
+                data = data[2:-1]  # Remove the b' and ' part
+                print("Stripped byte string literal from the data.")
+            
+            # Check if data is base64 encoded (this checks for base64 encoding)
+            if is_base64(data):  
+                # Base64 decode
+                data = base64.b64decode(data)
+                print(f"Base64 Decoded Data (bytes): {data[:100]}")  # Inspect first 100 bytes
+                app.logger.debug(f"Base64 Decoded Data (bytes): {data}")
+                
+                # If the base64 data is a string, decode bytes into a proper UTF-8 string
+                data = data.decode('utf-8', errors='ignore')
+                print(f"Decoded Data (UTF-8): {data[:100]}")  # Inspect first 100 characters after decoding
+                app.logger.debug(f"Decoded Data (UTF-8): {data}")
+            else:
+                print(f"Data is not base64 encoded, proceeding with the original string.")
+
+        except Exception as e:
+            print(f"Error during base64 decoding or UTF-8 decoding: {e}")
+            return abort(400)  # Handle base64 decoding error
+
+    # Check if data is empty after decoding
+    if not data:
+        print("Decoded data is empty.")
+        return abort(400)  # Handle empty data
+
+    # Attempt to parse JSON from data if it’s still in string format
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+            print(f"Decoded JSON Data: {data}")  # Inspect JSON structure
+            app.logger.debug(f"Decoded JSON Data: {data}")
+        except json.decoder.JSONDecodeError as e:
+            print(f"Error during JSON decoding: {e}")
+            app.logger.debug(f"Decoded data is not a valid JSON string: {data}")
+            return abort(400)  # Handle JSON decoding error
+
+    # Ensure data is a dictionary before using items()
+    if not isinstance(data, dict):
+        print(f"Decoded data is not a dictionary: {data}")
+        app.logger.debug(f"Decoded data is not a dictionary: {data}")
+        return abort(500)  # Handle invalid data type
+
 
     graph = pydot.Dot('BGPMAP', graph_type='digraph')
 
@@ -441,7 +542,6 @@ def show_bgpmap():
             edges[edge_tuple] = edge
         elif "label" in kwargs and kwargs["label"]:
             e = edges[edge_tuple]
-
             label_without_star = kwargs["label"].replace("*", "")
             if e.get_label() is not None:
                 labels = e.get_label().split("\r")
@@ -449,12 +549,14 @@ def show_bgpmap():
                 return edges[edge_tuple]
             if "%s*" % label_without_star not in labels:
                 labels = [ kwargs["label"] ]  + [ l for l in labels if not l.startswith(label_without_star) ]
-                labels = sorted(labels, cmp=lambda x,y: x.endswith("*") and -1 or 1)
+                labels = sorted(labels, key=cmp_to_key(lambda x, y: -1 if x.endswith("*") else 1))
                 label = escape("\r".join(labels))
                 e.set_label(label)
         return edges[edge_tuple]
 
-    for host, asmaps in data.iteritems():
+    previous_as = None
+    hosts = data.keys()
+    for host, asmaps in data.items():
         if "DOMAIN" in app.config:
             add_node(host, label= "%s\r%s" % (host.upper(), app.config["DOMAIN"].upper()), shape="box", fillcolor="#F5A9A9")
         else:
@@ -467,10 +569,8 @@ def show_bgpmap():
             edge.set_color("red")
             edge.set_style("bold")
 
-    #colors = [ "#009e23", "#1a6ec1" , "#d05701", "#6f879f", "#939a0e", "#0e9a93", "#9a0e85", "#56d8e1" ]
     previous_as = None
-    hosts = data.keys()
-    for host, asmaps in data.iteritems():
+    for host, asmaps in data.items():
         first = True
         for asmap in asmaps:
             previous_as = host
@@ -521,23 +621,23 @@ def show_bgpmap():
             first = False
 
     for _as in prepend_as:
-        for n in set([ n for h, d in prepend_as[_as].iteritems() for p, n in d.iteritems() ]):
+        for n in set([ n for h, d in prepend_as[_as].items() for p, n in d.items() ]):
             graph.add_edge(pydot.Edge(*(_as, _as), label=" %dx" % n, color="grey", fontcolor="grey"))
 
+    # Determine response format and return it
     fmt = request.args.get('fmt', 'png')
-    #response = Response("<pre>" + graph.create_dot() + "</pre>")
     if fmt == "png":
         response = Response(graph.create_png(), mimetype='image/png')
     elif fmt == "svg":
         response = Response(graph.create_svg(), mimetype='image/svg+xml')
     else:
         abort(400, "Incorrect format")
+    
     response.headers['Last-Modified'] = datetime.now()
-    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
+#    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
     response.headers['Pragma'] = 'no-cache'
-    response.headers['Expires'] = '-1'
+#    response.headers['Expires'] = '-1'
     return response
-
 
 
 def build_as_tree_from_raw_bird_ouput(host, proto, text):
@@ -570,7 +670,7 @@ def build_as_tree_from_raw_bird_ouput(host, proto, text):
             if expr2.group(4):
                 peer_protocol_name = expr2.group(4).strip()
             # Check if via line is a internal route
-            for rt_host, rt_ips in app.config["ROUTER_IP"].iteritems():
+            for rt_host, rt_ips in app.config["ROUTER_IP"].items():
                 # Special case for internal routing
                 if peer_ip in rt_ips:
                     path = [rt_host]
@@ -658,7 +758,11 @@ def show_route(request_type, hosts, proto):
     errors = []
     for host in hosts.split("+"):
         ret, res = bird_command(host, proto, command)
+        if isinstance(res, bytes):
+            res = res.decode('utf-8')
+
         res = res.split("\n")
+
 
         if ret is False:
             errors.append("%s" % res)
@@ -674,7 +778,7 @@ def show_route(request_type, hosts, proto):
             detail[host] = add_links(res)
 
     if bgpmap:
-        detail = base64.b64encode(json.dumps(detail))
+        detail = base64.b64encode(json.dumps(detail).encode('utf-8'))
 
     return render_template((bgpmap and 'bgpmap.html' or 'route.html'), detail=detail, command=command, expression=expression, errors=errors)
 
